@@ -138,7 +138,7 @@ std::string GCodeWriter::set_temperature(unsigned int temperature, GCodeFlavor f
                 gcode << " P" << tool;
             }
         }
-        gcode << "; wait for temperature to be reached\n ";
+        gcode << "; wait for temperature to be reached\n";
     }
 
 
