@@ -1517,7 +1517,10 @@ void GCodeProcessor::run_post_process()
                             const int real_tool = tool_number < m_physical_extruder_map.size() ? m_physical_extruder_map[tool_number] : tool_number;
                             std::string comment = "preheat T" + std::to_string(real_tool) +
                                                 " time: " + std::to_string((int) std::round(time_diffs[0])) + "s";
-                            return GCodeWriter::set_temperature(temperature, this->m_flavor, false, real_tool, comment);
+                            // For RepRapFirmware, set R (standby temp) to target so the tool
+                            // starts heating while still in standby
+                            int standby_temp = (this->m_flavor == gcfRepRapFirmware) ? temperature : -1;
+                            return GCodeWriter::set_temperature(temperature, this->m_flavor, false, real_tool, comment, standby_temp);
                         }
                     },
                     // line replacer
