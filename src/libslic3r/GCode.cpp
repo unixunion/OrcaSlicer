@@ -257,19 +257,28 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
 
         unsigned int extruder_id = gcodegen.writer().filament()->id();
         const auto& filament_idle_temp = gcodegen.config().idle_temperature;
+        int idle_temp = 0;
         if (filament_idle_temp.get_at(extruder_id) == 0) {
             // There is no idle temperature defined in filament settings.
             // Use the delta value from print config.
             if (gcodegen.config().standby_temperature_delta.value != 0) {
-                // we assume that heating is always slower than cooling, so no need to block
-                gcode += gcodegen.writer().set_temperature
-                (this->_get_temp(gcodegen) + gcodegen.config().standby_temperature_delta.value, false, extruder_id);
-                gcode.pop_back();
-                gcode += " ;cooldown\n"; // this is a marker for GCodeProcessor, so it can supress the commands when needed
+                idle_temp = this->_get_temp(gcodegen) + gcodegen.config().standby_temperature_delta.value;
             }
         } else {
             // Use the value from filament settings. That one is absolute, not delta.
-            gcode += gcodegen.writer().set_temperature(filament_idle_temp.get_at(extruder_id), false, extruder_id);
+            idle_temp = filament_idle_temp.get_at(extruder_id);
+        }
+
+        if (idle_temp > 0) {
+            if (gcodegen.writer().get_gcode_flavor() == gcfRepRapFirmware) {
+                // For RepRapFirmware, keep S at the full active temp and set R (standby) to idle.
+                // The tool will cool to R while in standby, and already have the correct S when re-selected.
+                int active_temp = this->_get_temp(gcodegen);
+                gcode += gcodegen.writer().set_temperature(active_temp, false, extruder_id, idle_temp);
+            } else {
+                // we assume that heating is always slower than cooling, so no need to block
+                gcode += gcodegen.writer().set_temperature(idle_temp, false, extruder_id);
+            }
             gcode.pop_back();
             gcode += " ;cooldown\n"; // this is a marker for GCodeProcessor, so it can supress the commands when needed
         }

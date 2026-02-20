@@ -95,7 +95,7 @@ std::string GCodeWriter::postamble() const
     return gcode.str();
 }
 
-std::string GCodeWriter::set_temperature(unsigned int temperature, GCodeFlavor flavor, bool wait, int tool, std::string comment){
+std::string GCodeWriter::set_temperature(unsigned int temperature, GCodeFlavor flavor, bool wait, int tool, std::string comment, int standby_temperature){
     if (wait && (flavor == gcfMakerWare || flavor == gcfSailfish))
         return "";
 
@@ -129,6 +129,9 @@ std::string GCodeWriter::set_temperature(unsigned int temperature, GCodeFlavor f
             gcode << " T" << tool;
         }
     }
+    if (flavor == gcfRepRapFirmware && standby_temperature >= 0) {
+        gcode << " R" << standby_temperature;
+    }
     gcode << " ; " << comment << "\n";
 
     if ((flavor == gcfTeacup || flavor == gcfRepRapFirmware) && wait) {
@@ -145,12 +148,12 @@ std::string GCodeWriter::set_temperature(unsigned int temperature, GCodeFlavor f
     return gcode.str();
 }
 
-std::string GCodeWriter::set_temperature(unsigned int temperature, bool wait, int tool) const
+std::string GCodeWriter::set_temperature(unsigned int temperature, bool wait, int tool, int standby_temperature) const
 {
     // set tool to -1 to make sure we won't emit T parameter for single extruder or SEMM
     if (!this->multiple_extruders || m_single_extruder_multi_material)
         tool = -1;
-    return set_temperature(temperature, this->config.gcode_flavor, wait, tool);
+    return set_temperature(temperature, this->config.gcode_flavor, wait, tool, std::string(), standby_temperature);
 }
 
 // BBS
@@ -257,6 +260,16 @@ std::string GCodeWriter::set_jerk_xy(double jerk)
             jerk = m_max_jerk_y;
         
         gcode << "SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=" << jerk;
+    } else if (FLAVOR_IS(gcfRepRapFirmware)) {
+        double jerk_x = jerk;
+        double jerk_y = jerk;
+        // Clamp the axis jerk to the allowed maximum.
+        if (m_max_jerk_x > 0 && jerk > m_max_jerk_x)
+            jerk_x = m_max_jerk_x;
+        if (m_max_jerk_y > 0 && jerk > m_max_jerk_y)
+            jerk_y = m_max_jerk_y;
+        // RepRapFirmware uses M566 with values in mm/min
+        gcode << "M566 X" << jerk_x * 60 << " Y" << jerk_y * 60;
     } else {
         double jerk_x = jerk;
         double jerk_y = jerk;
@@ -265,7 +278,7 @@ std::string GCodeWriter::set_jerk_xy(double jerk)
             jerk_x = m_max_jerk_x;
         if (m_max_jerk_y > 0 && jerk > m_max_jerk_y)
             jerk_y = m_max_jerk_y;
-        
+
         gcode << "M205 X" << jerk_x << " Y" << jerk_y;
     }
       
