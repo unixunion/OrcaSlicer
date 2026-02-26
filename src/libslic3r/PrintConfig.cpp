@@ -5438,6 +5438,26 @@ void PrintConfigDef::init_fff_params()
     def->mode = comDevelop;
     def->set_default_value(new ConfigOptionInt(1));
 
+    def = this->add("idle_timeout", coFloat);
+    def->label = L("Idle timeout");
+    def->tooltip = L("If an extruder will not be used for longer than this time, turn its heater off completely instead of holding "
+                     "at standby temperature. Set to 0 to disable.");
+    def->sidetext = L("min");
+    def->min = 0;
+    def->max = 300;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("cold_preheat_time", coFloat);
+    def->label = L("Cold preheat time");
+    def->tooltip = L("Time in seconds to begin preheating an extruder that has been completely turned off. "
+                     "This should be longer than the normal preheat time since the tool is starting from room temperature.");
+    def->sidetext = L("s");
+    def->min = 0;
+    def->max = 300;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(90));
+
 
     def = this->add("file_start_gcode", coString);
     def->label = L("File header G-code");

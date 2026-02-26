@@ -806,6 +806,8 @@ class Print;
         bool m_single_extruder_multi_material;
         float m_preheat_time;
         int m_preheat_steps;
+        float m_idle_timeout{0.f};        // minutes; 0 = disabled
+        float m_cold_preheat_time{90.f};  // seconds
         bool m_disable_m73;
 
         enum class EProducer

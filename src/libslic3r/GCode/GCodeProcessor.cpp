@@ -1231,7 +1231,10 @@ void GCodeProcessor::run_post_process()
     };
 
     // add lines M104 to exported gcode
-    auto process_line_T = [this, &export_line](const std::string& gcode_line, const size_t g1_lines_counter, const ExportLines::Backtrace& backtrace) {
+    auto process_line_T = [this, &export_line](
+        const std::string& gcode_line, const size_t g1_lines_counter,
+        const ExportLines::Backtrace& backtrace,
+        int prev_tool, bool turn_off_prev_tool) {
         const std::string cmd = GCodeReader::GCodeLine::extract_cmd(gcode_line);
 
         int tool_number = -1;
@@ -1288,17 +1291,39 @@ void GCodeProcessor::run_post_process()
                             return GCodeWriter::set_temperature(temperature, this->m_flavor, false, real_tool, comment);
                         }
                     },
-                    // line replacer
-                    [this, tool_number](const std::string& line) {
-                        if (GCodeReader::GCodeLine::cmd_is(line, "M104")) {
+                    // line replacer — removes cooldown for incoming tool (preheat replaces it),
+                    // and optionally replaces cooldown for outgoing tool with heater-off if idle timeout applies
+                    [this, tool_number, prev_tool, turn_off_prev_tool](const std::string& line) {
+                        const bool is_m104 = GCodeReader::GCodeLine::cmd_is(line, "M104");
+                        const bool is_g10  = (m_flavor == gcfRepRapFirmware) && GCodeReader::GCodeLine::cmd_is(line, "G10");
+
+                        if (is_m104 || is_g10) {
                             GCodeReader::GCodeLine gline;
                             GCodeReader reader;
                             reader.parse_line(line, [&gline](GCodeReader& reader, const GCodeReader::GCodeLine& l) { gline = l; });
 
+                            const char tool_param = is_g10 ? 'P' : 'T';
                             float val;
-                            if (gline.has_value('T', val) && gline.raw().find("cooldown") != std::string::npos) {
-                                if (static_cast<int>(val) == (tool_number < m_physical_extruder_map.size() ? m_physical_extruder_map[tool_number] : tool_number))
-                                    return std::string("; removed M104\n");
+                            if (gline.has_value(tool_param, val) && gline.raw().find("cooldown") != std::string::npos) {
+                                const int line_tool = static_cast<int>(val);
+                                const int physical_incoming = tool_number < (int)m_physical_extruder_map.size()
+                                    ? m_physical_extruder_map[tool_number] : tool_number;
+
+                                // Remove cooldown for incoming tool (preheat replaces it)
+                                if (line_tool == physical_incoming)
+                                    return std::string(is_g10 ? "; removed G10\n" : "; removed M104\n");
+
+                                // Replace cooldown for outgoing tool with heater off if idle timeout applies
+                                if (turn_off_prev_tool && prev_tool >= 0) {
+                                    const int physical_prev = prev_tool < (int)m_physical_extruder_map.size()
+                                        ? m_physical_extruder_map[prev_tool] : prev_tool;
+                                    if (line_tool == physical_prev) {
+                                        if (is_g10)
+                                            return std::string("G10 P" + std::to_string(physical_prev) + " S0 R0 ; idle timeout off\n");
+                                        else
+                                            return std::string("M104 S0 T" + std::to_string(physical_prev) + " ; idle timeout off\n");
+                                    }
+                                }
                             }
                         }
                         return line;
@@ -1312,11 +1337,88 @@ void GCodeProcessor::run_post_process()
     // m_result.lines_ends.emplace_back(std::vector<size_t>());
 
     unsigned int line_id = 0;
-    // Backtrace data for Tx gcode lines
-    const ExportLines::Backtrace backtrace_T = { m_preheat_time, m_preheat_steps };
+    // Backtrace data for Tx gcode lines (non-const: time varies for cold vs warm tools)
+    ExportLines::Backtrace backtrace_T = { m_preheat_time, m_preheat_steps };
     // In case there are multiple sources of backtracing, keeps track of the longest backtrack time needed
     // to flush the backtrace cache accordingly
-    float max_backtrace_time = 120.0f;
+    float max_backtrace_time = std::max(120.0f, m_cold_preheat_time * 1.1f);
+
+    // --- Pre-scan: build per-tool usage time lists for idle timeout decisions ---
+    // tool_usage_times[t] = sorted list of elapsed times when tool t is activated
+    const size_t num_tools = m_filament_nozzle_temp.size();
+    std::vector<std::vector<float>> tool_usage_times(num_tools);
+    std::vector<float> tc_elapsed_times; // elapsed time at each T command, in file order
+    const bool idle_timeout_enabled = m_idle_timeout > 0.f && m_result.backtrace_enabled;
+    const bool cold_preheat_enabled = m_cold_preheat_time > m_preheat_time && m_result.backtrace_enabled;
+    if (idle_timeout_enabled || cold_preheat_enabled) {
+        // Lightweight scan of the file to find T commands and their approximate g1_line positions
+        const auto& g1_cache = m_time_processor.machines[static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal)].g1_times_cache;
+        size_t prescan_g1_count = 0;
+        std::string prescan_line;
+        std::vector<char> prescan_buf(65536, 0);
+        for (;;) {
+            size_t cnt = ::fread(prescan_buf.data(), 1, prescan_buf.size(), in.f);
+            if (cnt == 0) break;
+            auto it = prescan_buf.begin();
+            auto it_end = prescan_buf.begin() + cnt;
+            while (it != it_end) {
+                // Find end of line
+                auto nl = std::find(it, it_end, '\n');
+                if (nl != it_end) {
+                    // Found newline — append up to and including it
+                    prescan_line.append(it, nl + 1);
+                    it = nl + 1;
+                } else {
+                    // No newline — append rest of buffer, line continues in next chunk
+                    prescan_line.append(it, it_end);
+                    it = it_end;
+                    if (!::feof(in.f))
+                        continue; // more data to read, line is incomplete
+                }
+                // Process complete line
+                if (!prescan_line.empty()) {
+                    if (GCodeReader::GCodeLine::cmd_is(prescan_line, "G0") ||
+                        GCodeReader::GCodeLine::cmd_is(prescan_line, "G1") ||
+                        GCodeReader::GCodeLine::cmd_is(prescan_line, "G2") ||
+                        GCodeReader::GCodeLine::cmd_is(prescan_line, "G3") ||
+                        GCodeReader::GCodeLine::cmd_is(prescan_line, "G28")) {
+                        ++prescan_g1_count;
+                    } else if (GCodeReader::GCodeLine::cmd_starts_with(prescan_line, "T")) {
+                        int t = -1;
+                        const std::string tcmd = GCodeReader::GCodeLine::extract_cmd(prescan_line);
+                        if (tcmd.size() >= 2 && parse_number(std::string_view(tcmd).substr(1), t) &&
+                            t >= 0 && t < (int)num_tools) {
+                            // Look up elapsed time from g1_times_cache using lower_bound
+                            auto cache_it = std::lower_bound(g1_cache.begin(), g1_cache.end(), prescan_g1_count,
+                                [](const TimeMachine::G1LinesCacheItem& item, size_t val) { return item.id < val; });
+                            float elapsed = 0.f;
+                            if (cache_it != g1_cache.end() && cache_it->id == prescan_g1_count) {
+                                elapsed = cache_it->elapsed_time;
+                            } else if (cache_it != g1_cache.begin()) {
+                                --cache_it;
+                                elapsed = cache_it->elapsed_time;
+                            }
+                            tool_usage_times[t].push_back(elapsed);
+                            tc_elapsed_times.push_back(elapsed);
+                        }
+                    }
+                    prescan_line.clear();
+                }
+            }
+        }
+        // Seek back to start for the main processing loop
+        if (::fseek(in.f, 0, SEEK_SET) != 0)
+            throw Slic3r::RuntimeError(std::string("GCode processor post process failed.\nCannot seek to beginning of file after pre-scan.\n"));
+    }
+
+    // State tracking for idle timeout and cold preheat
+    int prev_tool = -1;
+    // All tools start warm — start gcode primes all hotends used in the print.
+    // Tools only become cold when idle timeout explicitly turns them off.
+    std::vector<bool> tool_is_cold(num_tools, false);
+    // Per-tool index into tool_usage_times for finding next use
+    std::vector<size_t> tool_usage_idx(num_tools, 0);
+    size_t tc_idx = 0; // index into tc_elapsed_times for current T command
 
     {
         // Read the input stream 64kB at a time, extract lines and process them.
@@ -1377,9 +1479,85 @@ void GCodeProcessor::run_post_process()
                             ++g1_lines_counter;
                         }
                         else if (m_result.backtrace_enabled && GCodeReader::GCodeLine::cmd_starts_with(gcode_line, "T")) {
+                            // Parse the incoming tool number
+                            int upcoming_tool = -1;
+                            {
+                                const std::string tcmd = GCodeReader::GCodeLine::extract_cmd(gcode_line);
+                                if (tcmd.size() >= 2)
+                                    parse_number(std::string_view(tcmd).substr(1), upcoming_tool);
+                            }
+
+                            // Determine if the incoming tool is cold → use longer preheat time
+                            // Only applies when cold preheat or idle timeout tracking is active
+                            if ((cold_preheat_enabled || idle_timeout_enabled) &&
+                                upcoming_tool >= 0 && upcoming_tool < (int)tool_is_cold.size() && tool_is_cold[upcoming_tool])
+                                backtrace_T.time = m_cold_preheat_time;
+                            else
+                                backtrace_T.time = m_preheat_time;
+
+                            // Look up current elapsed time for idle timeout decisions
+                            const float current_time = (idle_timeout_enabled && tc_idx < tc_elapsed_times.size())
+                                ? tc_elapsed_times[tc_idx] : 0.f;
+                            const float idle_threshold_s = m_idle_timeout * 60.f;
+
+                            // Determine if the outgoing tool should be turned off (idle timeout)
+                            bool turn_off_prev = false;
+                            if (idle_timeout_enabled && prev_tool >= 0 && prev_tool < (int)num_tools) {
+                                // Find next use of prev_tool after the current tool change
+                                const auto& usages = tool_usage_times[prev_tool];
+                                auto& idx = tool_usage_idx[prev_tool];
+                                while (idx < usages.size() && usages[idx] <= current_time)
+                                    ++idx;
+                                if (idx >= usages.size()) {
+                                    turn_off_prev = true;
+                                } else {
+                                    turn_off_prev = (usages[idx] - current_time) > idle_threshold_s;
+                                }
+                            }
+                            // Advance tc_idx only for valid tools (matching prescan filter)
+                            if (upcoming_tool >= 0 && upcoming_tool < (int)num_tools)
+                                ++tc_idx;
+
                             // add lines M104 where needed
-                            process_line_T(gcode_line, g1_lines_counter, backtrace_T);
+                            process_line_T(gcode_line, g1_lines_counter, backtrace_T, prev_tool, turn_off_prev);
                             max_backtrace_time = std::max(max_backtrace_time, backtrace_T.time);
+
+                            // Update state: mark outgoing tool as cold if turned off, incoming as warm
+                            if (cold_preheat_enabled || idle_timeout_enabled) {
+                                if (turn_off_prev && prev_tool >= 0 && prev_tool < (int)tool_is_cold.size())
+                                    tool_is_cold[prev_tool] = true;
+                                if (upcoming_tool >= 0 && upcoming_tool < (int)tool_is_cold.size())
+                                    tool_is_cold[upcoming_tool] = false;
+                            }
+
+                            // Check ALL other warm tools for idle timeout.
+                            // This catches tools heated by start gcode that won't be needed for a long time.
+                            // prev_tool is already handled by the line_replacer above.
+                            if (idle_timeout_enabled) {
+                                for (int t = 0; t < (int)num_tools; ++t) {
+                                    if (t == upcoming_tool || t == prev_tool || tool_is_cold[t])
+                                        continue;
+                                    const auto& usages = tool_usage_times[t];
+                                    auto& idx = tool_usage_idx[t];
+                                    while (idx < usages.size() && usages[idx] <= current_time)
+                                        ++idx;
+                                    bool should_off = (idx >= usages.size()) ||
+                                                      ((usages[idx] - current_time) > idle_threshold_s);
+                                    if (should_off) {
+                                        const int phys = t < (int)m_physical_extruder_map.size()
+                                            ? m_physical_extruder_map[t] : t;
+                                        std::string off_cmd;
+                                        if (m_flavor == gcfRepRapFirmware)
+                                            off_cmd = "G10 P" + std::to_string(phys) + " S0 R0 ; idle timeout off\n";
+                                        else
+                                            off_cmd = "M104 S0 T" + std::to_string(phys) + " ; idle timeout off\n";
+                                        export_line.append_line(off_cmd);
+                                        tool_is_cold[t] = true;
+                                    }
+                                }
+                            }
+
+                            prev_tool = upcoming_tool;
                         }
                     }
 
@@ -1943,6 +2121,8 @@ void GCodeProcessor::apply_config(const PrintConfig& config)
     // sanity check
     if(m_preheat_steps < 1)
         m_preheat_steps = 1;
+    m_idle_timeout = config.idle_timeout;
+    m_cold_preheat_time = config.cold_preheat_time;
     m_result.backtrace_enabled = config.ooze_prevention && m_preheat_time > 0 && (m_is_XL_printer || (!m_single_extruder_multi_material && filament_count > 1));
 
     assert(config.nozzle_volume.size() == config.nozzle_diameter.size());

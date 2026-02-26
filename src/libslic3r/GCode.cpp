@@ -7611,7 +7611,12 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
         {
             //BBS: gcode writer doesn't know where the extruder is and whether fan speed is changed after inserting tool change gcode
             //Set this flag so that normal lift will be used the first time after tool change.
-            gcode += ";_FORCE_RESUME_FAN_SPEED\n";
+            // Only emit the placeholder when CoolingBuffer is active (m_enable_cooling_markers),
+            // as CoolingBuffer is responsible for replacing it with the actual fan command.
+            // When cooling markers are disabled (e.g. between-objects toolchange in sequential mode),
+            // CoolingBuffer won't process this layer, so the placeholder would appear raw in the output.
+            if (m_enable_cooling_markers)
+                gcode += ";_FORCE_RESUME_FAN_SPEED\n";
             m_writer.set_current_position_clear(false);
             //BBS: check whether custom gcode changes the z position. Update if changed
             double temp_z_after_tool_change;
