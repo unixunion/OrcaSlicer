@@ -7663,8 +7663,11 @@ std::string GCode::set_extruder(unsigned int new_filament_id, double print_z, bo
         // user provided his own toolchange gcode, no need to do anything
     }
 
-    // Resume fan speed after tool change so it applies to the new tool
-    if (!change_filament_gcode.empty() && !(m_config.manual_filament_change.value && m_toolchange_count == 1))
+    // Resume fan speed after tool change so it applies to the new tool.
+    // Only emit the placeholder when CoolingBuffer is active (m_enable_cooling_markers),
+    // as CoolingBuffer is responsible for replacing it with the actual fan command.
+    if (m_enable_cooling_markers && !change_filament_gcode.empty() &&
+        !(m_config.manual_filament_change.value && m_toolchange_count == 1))
         gcode += ";_FORCE_RESUME_FAN_SPEED\n";
 
     // Set the temperature if the wipe tower didn't (not needed for non-single extruder MM)
